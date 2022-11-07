@@ -3,18 +3,18 @@
 from django.core.exceptions import ValidationError as InternalValidationError
 from django.core.exceptions import ImproperlyConfigured
 from django.db.models import Q, Prefetch, Manager
+from django.db.models.expressions import RawSQL, OrderBy
 import six
 from functools import reduce
 from rest_framework import __version__ as drf_version
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
 try:
-    from rest_framework.fields import BooleanField, NullBooleanField
+    from rest_framework.fields import BooleanField, NullBooleanField, JSONField
 except ImportError:
     # DRF >= 3.14.0
-    from rest_framework.fields import BooleanField
+    from rest_framework.fields import BooleanField, JSONField
 from rest_framework.filters import BaseFilterBackend, OrderingFilter
-
 from dynamic_rest.utils import is_truthy
 from dynamic_rest.conf import settings
 from dynamic_rest.datastructures import TreeMap
@@ -93,7 +93,7 @@ class FilterNode(object):
     def generate_query_key(self, serializer):
         """Get the key that can be passed to Django's filter method.
 
-        To account for serialier field name rewrites, this method
+        To account for serializer field name rewrites, this method
         translates serializer field names to model field names
         by inspecting `serializer`.
 
@@ -132,6 +132,8 @@ class FilterNode(object):
             # For remote fields, strip off '_set' for filtering. This is a
             # weird Django inconsistency.
             model_field_name = field.source or field_name
+            if model_field_name == '*':
+                continue
             model_field = get_model_field(s.get_model(), model_field_name)
             if isinstance(model_field, RelatedObject):
                 model_field_name = model_field.field.related_query_name()
@@ -145,6 +147,15 @@ class FilterNode(object):
 
             # Recurse into nested field
             s = getattr(field, 'serializer', None)
+            if isinstance(field, JSONField):
+                # If a json field is found, append any terms following
+                j = i+1
+                while j < len(self.field):
+                    rewritten.append(self.field[j])
+                    j += 1
+                if self.operator:
+                    rewritten.append(self.operator)
+                return ('__'.join(rewritten), field)
             if isinstance(s, serializers.ListSerializer):
                 s = s.child
             if not s:
@@ -156,15 +167,19 @@ class FilterNode(object):
         return ('__'.join(rewritten), field)
 
 
-def rewrite_filters(fs, serializer):
+def rewrite_filters(filters, serializer):
     out = {}
-    for node in fs.values():
+    json_out = {}
+    for k, node in six.iteritems(filters):
         filter_key, field = node.generate_query_key(serializer)
         if isinstance(field, DRF_BOOLEAN_FIELD):
             node.value = is_truthy(node.value)
-        out[filter_key] = node.value
 
-    return out
+        if isinstance(field, JSONField):
+            json_out[tuple(node.field)] = (node.operator, node.value)
+        else:
+            out[filter_key] = node.value
+    return out, json_out
 
 
 def clause_to_q(clause, serializer):
@@ -334,16 +349,17 @@ class DynamicFilterBackend(BaseFilterBackend):
             Q(foo='bar', baz__in=[1, 2])
 
         Arguments:
-          includes: TreeMap representing inclusion filters.
-          excludes: TreeMap representing exclusion filters.
           filters: TreeMap with include/exclude filters OR query map
           serializer: serializer instance of top-level object
           q: Q() object (optional)
 
         Returns:
-          Q() instance or None if no inclusion or exclusion filters
-          were specified.
+          Tuple of:
+              * Q() instance or None if no inclusion or exclusion filters
+                were specified.
+              * dictionary of {(field,): (operator, value)} for any json fields
         """
+        json_extras = None
 
         if (
             not filters.get('_complex')
@@ -353,16 +369,18 @@ class DynamicFilterBackend(BaseFilterBackend):
             q = q or Q()
 
             if not includes and not excludes:
-                return None
+                return None, None
 
             if includes:
-                includes = rewrite_filters(includes, serializer)
+                includes, json_extras = rewrite_filters(includes, serializer)
                 q &= Q(**includes)
             if excludes:
-                excludes = rewrite_filters(excludes, serializer)
+                excludes, json_extras = rewrite_filters(excludes, serializer)
                 for k, v in six.iteritems(excludes):
                     q &= ~Q(**{k: v})
-            return q
+            return q, json_extras
+
+        # JSON filtering for complex queries currently unsupported
         else:
             filters = filters.get('_complex')
             ors = filters.get('.or') or filters.get('$or')
@@ -372,18 +390,20 @@ class DynamicFilterBackend(BaseFilterBackend):
             if ors:
                 result = reduce(
                     OR,
-                    [self._filters_to_query({"_complex": f}, serializer) for f in ors]
+                    [self._filters_to_query({"_complex": f}, serializer)[0] for f in ors]
                 )
-                return result
+                return result, json_extras
             if ands:
-                return reduce(
+                result = reduce(
                     AND,
-                    [self._filters_to_query({"_complex": f}, serializer) for f in ands]
+                    [self._filters_to_query({"_complex": f}, serializer)[0] for f in ands]
                 )
+                return result, json_extras
             clauses = [
                 clause_to_q(clause, serializer) for clause in filters.items()
             ]
-            return reduce(AND, clauses) if clauses else q
+            result = reduce(AND, clauses) if clauses else q
+            return result, json_extras
 
     def _create_prefetch(self, source, queryset):
         return Prefetch(source, queryset=queryset)
@@ -596,18 +616,25 @@ class DynamicFilterBackend(BaseFilterBackend):
             queryset = queryset.only(*only)
 
         # add request filters
-        query = self._filters_to_query(filters=filters, serializer=serializer)
+        query, json_extras = self._filters_to_query(
+            filters=filters,
+            serializer=serializer,
+        )
 
         # add additional filters specified by calling view
         if extra_filters:
             query = extra_filters if not query else extra_filters & query
 
-        if query:
+        if query or json_extras:
             # Convert internal django ValidationError to
             # APIException-based one in order to resolve validation error
             # from 500 status code to 400.
             try:
                 queryset = queryset.filter(query)
+
+                if json_extras:
+                    extra_queries = self._get_json_queries(json_extras)
+                    queryset = queryset.extra(where=extra_queries)
             except InternalValidationError as e:
                 raise ValidationError(dict(e) if hasattr(e, 'error_dict') else list(e))
             except Exception as e:
@@ -637,6 +664,52 @@ class DynamicFilterBackend(BaseFilterBackend):
         if self.DEBUG:
             queryset._using_prefetches = prefetches
         return queryset
+
+    def _get_json_queries(self, json_extras):
+        extra_queries = []
+
+        for json_field_names, (operator, value) in six.iteritems(json_extras):
+            if not operator:
+                query_operator = '='
+                value = "'{}'".format(value)
+            elif operator in ('startswith', 'istartswith'):
+                query_operator = 'ILIKE' if operator[0] == 'i' else 'LIKE'
+                value = "'{}%%'".format(value)
+            elif operator in ('endswith', 'iendswith'):
+                query_operator = 'ILIKE' if operator[0] == 'i' else 'LIKE'
+                value = "'%%{}'".format(value)
+            elif operator in ('contains', 'icontains'):
+                query_operator = 'ILIKE' if operator[0] == 'i' else 'LIKE'
+                value = "'%%{}%%'".format(value)
+
+            else:
+                raise InternalValidationError(
+                    f"""Unsupported filter operation for nested JSON fields:
+                    {operator}"""
+                )
+
+            extra_query = []
+
+            for idx, k in enumerate(json_field_names):
+                if idx == 0:
+                    extra_query.append(k)
+                else:
+                    extra_query.append("'{}'".format(k))
+
+                if idx == len(json_field_names) - 1:
+                    continue
+                # the ->> operator returns a raw value
+                elif idx == len(json_field_names) - 2:
+                    extra_query.append('->>')
+                # the -> operator returns JSON
+                else:
+                    extra_query.append('->')
+
+            extra_query.append(query_operator)
+            extra_query.append(value)
+            extra_queries.append(' '.join(extra_query))
+
+        return extra_queries
 
 
 class FastDynamicFilterBackend(DynamicFilterBackend):
@@ -678,7 +751,16 @@ class DynamicSortingFilter(OrderingFilter):
         """
         self.ordering_param = view.SORT
 
-        ordering = self.get_ordering(request, queryset, view)
+        ordering, nested = self.get_ordering(request, queryset, view)
+        if ordering and nested:
+            ordering_str = ''.join(ordering)
+            if ordering_str.startswith('-'):
+                return queryset.order_by(
+                    OrderBy(RawSQL('LOWER( %s )' % (ordering_str[1:]), nested),
+                            descending=True))
+            return queryset.order_by(
+                OrderBy(RawSQL('LOWER(%s)' % (ordering_str), nested),
+                        descending=False))
         if ordering:
             queryset = queryset.order_by(*ordering)
             if any(['__' in o for o in ordering]):
@@ -694,21 +776,23 @@ class DynamicSortingFilter(OrderingFilter):
         This method overwrites the DRF default so it can parse the array.
         """
         params = view.get_request_feature(view.SORT)
+        nested = []
         if params:
             fields = [param.strip() for param in params]
-            valid_ordering, invalid_ordering = self.remove_invalid_fields(
-                queryset, fields, view
-            )
+            valid_ordering, invalid_ordering, nested = \
+                self.remove_invalid_fields(
+                    queryset, fields, view
+                )
 
             # if any of the sort fields are invalid, throw an error.
             # else return the ordering
             if invalid_ordering:
                 raise ValidationError("Invalid filter field: %s" % invalid_ordering)
             else:
-                return valid_ordering
+                return valid_ordering, nested
 
         # No sorting was included
-        return self.get_default_ordering(view)
+        return self.get_default_ordering(view), nested
 
     def remove_invalid_fields(self, queryset, fields, view):
         """Remove invalid fields from an ordering.
@@ -726,14 +810,14 @@ class DynamicSortingFilter(OrderingFilter):
             stripped_term = term.lstrip('-')
             # add back the '-' add the end if necessary
             reverse_sort_term = '' if len(stripped_term) is len(term) else '-'
-            ordering = self.ordering_for(stripped_term, view)
+            ordering, nested = self.ordering_for(stripped_term, view)
 
             if ordering:
                 valid_orderings.append(reverse_sort_term + ordering)
             else:
                 invalid_orderings.append(term)
 
-        return valid_orderings, invalid_orderings
+        return valid_orderings, invalid_orderings, nested
 
     def ordering_for(self, term, view):
         """
@@ -743,7 +827,7 @@ class DynamicSortingFilter(OrderingFilter):
         Raise ImproperlyConfigured if serializer_class not set on view
         """
         if not self._is_allowed_term(term, view):
-            return None
+            return None, None
 
         serializer = self._get_serializer_class(view)()
         serializer_chain = term.split('.')
@@ -753,12 +837,30 @@ class DynamicSortingFilter(OrderingFilter):
         for segment in serializer_chain[:-1]:
             field = serializer.get_all_fields().get(segment)
 
+            # If its a JSONField, construct a RawSQL command in the form
+            # of 'jsonField->{}'.format('nestedField')' or
+            # 'jsonField->>{}->{}'.format('nested','doubleNested')
+            if field and isinstance(field, JSONField):
+                json_chain_start = str(segment)
+                json_chain = ''
+                nested = []
+                first = True
+                for nterm in serializer_chain[1:]:
+                    if first:
+                        json_chain += '->>%s'
+                        first = False
+                    else:
+                        json_chain = '->%s' + json_chain
+                    nested.append(nterm)
+                json_chain = json_chain_start + json_chain
+                return json_chain, nested
+
             if not (
                 field
                 and field.source != '*'
                 and isinstance(field, DynamicRelationField)
             ):
-                return None
+                return None, None
 
             model_chain.append(field.source or segment)
 
@@ -768,11 +870,11 @@ class DynamicSortingFilter(OrderingFilter):
         last_field = serializer.get_all_fields().get(last_segment)
 
         if not last_field or last_field.source == '*':
-            return None
+            return None, None
 
         model_chain.append(last_field.source or last_segment)
 
-        return '__'.join(model_chain)
+        return '__'.join(model_chain), None
 
     def _is_allowed_term(self, term, view):
         valid_fields = getattr(view, 'ordering_fields', self.ordering_fields)
